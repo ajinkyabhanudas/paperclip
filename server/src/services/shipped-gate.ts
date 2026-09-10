@@ -1,10 +1,12 @@
 // Deterministic "shipped" gate (CIR-39): an issue that carries a commit-type
 // work product cannot transition to "done" unless the claimed commit really
-// exists in the named repo and its real diff matches the files the work
-// product claims to have touched. This runs at the same
-// executionPolicy.stages boundary in routes/issues.ts that CIR-34's own
-// spike proved cannot be bypassed by a direct status PATCH — it is not a
-// cooperative checklist item an agent can skip.
+// exists in the named repo. When the work product also lists the files it
+// claims to touch (metadata.files), the real diff must match exactly; when
+// it only carries a changedFiles count (the only thing any current creation
+// path populates), the real diff's file count must match instead. This runs
+// at the same executionPolicy.stages boundary in routes/issues.ts that
+// CIR-34's own spike proved cannot be bypassed by a direct status PATCH — it
+// is not a cooperative checklist item an agent can skip.
 //
 // Scope (approved 2026-09-10, CIR-39 plan): fires only on issues that already
 // carry a "commit" work product — no gate, no claim, nothing to verify.
@@ -102,13 +104,6 @@ async function verifyCommitWorkProduct(
     );
   }
 
-  if (!claimedFiles) {
-    throw unprocessable(
-      `Shipped gate: commit work product "${product.title}" does not list the files it claims to have changed — cannot verify the diff matches the claim`,
-      { code: "shipped_gate_missing_file_claim", workProductId: product.id },
-    );
-  }
-
   let actualFiles: string[];
   try {
     // Plain diff-tree reports no files for a merge commit (git diffs it
@@ -127,10 +122,30 @@ async function verifyCommitWorkProduct(
     );
   }
 
-  if (!setsEqual(claimedFiles, actualFiles)) {
+  if (claimedFiles) {
+    // Explicit per-file claim: exact match, the strictest check available.
+    if (!setsEqual(claimedFiles, actualFiles)) {
+      throw unprocessable(
+        `Shipped gate: commit ${sha} in ${repo} touches different files than this work product claims — claimed [${claimedFiles.join(", ")}], actual [${actualFiles.join(", ")}]`,
+        { code: "shipped_gate_file_mismatch", workProductId: product.id, repo, sha, claimedFiles, actualFiles },
+      );
+    }
+    return;
+  }
+
+  // No caller today populates metadata.files (GitHub's per-commit file list
+  // and the local run-diff-summary path only ever surface a count). Falling
+  // back to a hard failure here would block every real commit work product
+  // from ever reaching "done", which is worse than the gap this gate exists
+  // to close. Fall back to the changedFiles count, which every existing
+  // creation path already sets — still catches "commit doesn't exist" and
+  // "diff size doesn't match what was claimed" without requiring a claim
+  // shape nothing produces yet.
+  const claimedCount = typeof metadata.changedFiles === "number" ? metadata.changedFiles : null;
+  if (claimedCount !== null && claimedCount !== actualFiles.length) {
     throw unprocessable(
-      `Shipped gate: commit ${sha} in ${repo} touches different files than this work product claims — claimed [${claimedFiles.join(", ")}], actual [${actualFiles.join(", ")}]`,
-      { code: "shipped_gate_file_mismatch", workProductId: product.id, repo, sha, claimedFiles, actualFiles },
+      `Shipped gate: commit ${sha} in ${repo} touched ${actualFiles.length} file(s), but this work product claims ${claimedCount}`,
+      { code: "shipped_gate_file_count_mismatch", workProductId: product.id, repo, sha, claimedCount, actualCount: actualFiles.length },
     );
   }
 }
