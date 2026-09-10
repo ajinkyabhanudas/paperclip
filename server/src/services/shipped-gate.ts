@@ -43,14 +43,15 @@ function loadConfiguredRepoLocalPaths(): Record<string, string> {
 }
 
 export function defaultResolveRepoLocalPath(repo: string): string | null {
+  // Exact match only. metadata.repo is stored as either a bare name
+  // ("circaid") or a GitHub "owner/repo" slug (see work-products.ts /
+  // github-commit-details.ts) -- matching only on the trailing segment would
+  // let a same-named-but-different repo ("someotherorg/circaid") resolve to
+  // this instance's real circaid checkout and get verified against the
+  // wrong history. Operators must configure SHIPPED_GATE_REPO_PATHS with
+  // whichever exact string metadata.repo actually uses.
   const configured = loadConfiguredRepoLocalPaths();
-  // metadata.repo is stored as either a bare name ("circaid") or a GitHub
-  // "owner/repo" slug (see work-products.ts / github-commit-details.ts) —
-  // try the exact key first, then fall back to the slug's repo segment so a
-  // path configured under "circaid" still resolves "someorg/circaid".
-  const shortName = repo.includes("/") ? repo.slice(repo.lastIndexOf("/") + 1) : repo;
-  return configured[repo] ?? DEFAULT_REPO_LOCAL_PATHS[repo]
-    ?? configured[shortName] ?? DEFAULT_REPO_LOCAL_PATHS[shortName] ?? null;
+  return configured[repo] ?? DEFAULT_REPO_LOCAL_PATHS[repo] ?? null;
 }
 
 async function runGit(args: string[], cwd: string): Promise<string> {
