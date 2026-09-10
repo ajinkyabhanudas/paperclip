@@ -42,7 +42,13 @@ function loadConfiguredRepoLocalPaths(): Record<string, string> {
 
 export function defaultResolveRepoLocalPath(repo: string): string | null {
   const configured = loadConfiguredRepoLocalPaths();
-  return configured[repo] ?? DEFAULT_REPO_LOCAL_PATHS[repo] ?? null;
+  // metadata.repo is stored as either a bare name ("circaid") or a GitHub
+  // "owner/repo" slug (see work-products.ts / github-commit-details.ts) —
+  // try the exact key first, then fall back to the slug's repo segment so a
+  // path configured under "circaid" still resolves "someorg/circaid".
+  const shortName = repo.includes("/") ? repo.slice(repo.lastIndexOf("/") + 1) : repo;
+  return configured[repo] ?? DEFAULT_REPO_LOCAL_PATHS[repo]
+    ?? configured[shortName] ?? DEFAULT_REPO_LOCAL_PATHS[shortName] ?? null;
 }
 
 async function runGit(args: string[], cwd: string): Promise<string> {
@@ -105,7 +111,14 @@ async function verifyCommitWorkProduct(
 
   let actualFiles: string[];
   try {
-    const stdout = await runGit(["diff-tree", "--no-commit-id", "--name-only", "-r", sha], repoPath);
+    // Plain diff-tree reports no files for a merge commit (git diffs it
+    // against nothing by default). Diff against the first parent instead so
+    // a merge that actually carries changes still verifies correctly.
+    const parentCount = (await runGit(["rev-list", "--parents", "-n", "1", sha], repoPath))
+      .trim().split(/\s+/).length - 1;
+    const stdout = parentCount > 1
+      ? await runGit(["diff", "--no-commit-id", "--name-only", "-r", `${sha}^1`, sha], repoPath)
+      : await runGit(["diff-tree", "--no-commit-id", "--name-only", "-r", sha], repoPath);
     actualFiles = stdout.split("\n").map((line) => line.trim()).filter(Boolean);
   } catch {
     throw unprocessable(
