@@ -142,7 +142,17 @@ async function verifyCommitWorkProduct(
   // "diff size doesn't match what was claimed" without requiring a claim
   // shape nothing produces yet.
   const claimedCount = typeof metadata.changedFiles === "number" ? metadata.changedFiles : null;
-  if (claimedCount !== null && claimedCount !== actualFiles.length) {
+  if (claimedCount === null) {
+    // No file-level claim and no count either: a bare {repo, sha} is not a
+    // verifiable claim, just an assertion. Failing closed here is the whole
+    // point of this gate -- an unrelated-but-real commit sha must not be
+    // enough to pass.
+    throw unprocessable(
+      `Shipped gate: commit work product "${product.title}" carries no diff evidence (no files list, no changedFiles count) — a bare commit sha is not a verifiable claim`,
+      { code: "shipped_gate_missing_diff_evidence", workProductId: product.id },
+    );
+  }
+  if (claimedCount !== actualFiles.length) {
     throw unprocessable(
       `Shipped gate: commit ${sha} in ${repo} touched ${actualFiles.length} file(s), but this work product claims ${claimedCount}`,
       { code: "shipped_gate_file_count_mismatch", workProductId: product.id, repo, sha, claimedCount, actualCount: actualFiles.length },
