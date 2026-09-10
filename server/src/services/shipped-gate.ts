@@ -54,8 +54,15 @@ export function defaultResolveRepoLocalPath(repo: string): string | null {
   return configured[repo] ?? DEFAULT_REPO_LOCAL_PATHS[repo] ?? null;
 }
 
+const GIT_TIMEOUT_MS = 10_000;
+
+// Three of the four call sites run this inside a DB transaction holding a
+// locked issue row (routes/issues.ts recovery path, issue-thread-interactions
+// completion review). A hung git process must not hold that lock forever --
+// bound every call so the worst case is a bounded stall, not a wedged
+// transaction / exhausted connection pool.
 async function runGit(args: string[], cwd: string): Promise<string> {
-  const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], { cwd });
+  const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], { cwd, timeout: GIT_TIMEOUT_MS });
   return stdout;
 }
 
