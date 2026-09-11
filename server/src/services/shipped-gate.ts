@@ -22,7 +22,7 @@ export interface RepoLocalPathResolver {
 }
 
 const DEFAULT_REPO_LOCAL_PATHS: Record<string, string> = {
-  circaid: "/Users/ajinkya/Desktop/circaid",
+  circaid: "/Users/ajinkya/Desktop/circaid-paperclip-pilot",
 };
 
 function loadConfiguredRepoLocalPaths(): Record<string, string> {
