@@ -12,7 +12,11 @@
 // carry a "commit" work product — no gate, no claim, nothing to verify.
 import type { IssueWorkProduct } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
-import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
+import {
+  isWorkspaceGitScanError,
+  WORKSPACE_GIT_SCAN_ERROR_CODES,
+  workspaceGitOperationScheduler,
+} from "./workspace-git-operation-scheduler.js";
 
 export interface RepoLocalPathResolver {
   (repo: string): string | null;
@@ -76,6 +80,22 @@ async function runGit(args: string[], cwd: string, repo: string): Promise<string
   return result.stdout;
 }
 
+// A saturated queue, a timeout, an output-limit trip, or a cancellation are
+// scheduler-operational conditions, not evidence about the commit itself --
+// retrying later can succeed. Only a real git failure (unknown revision,
+// corrupt object, exit code != 0) means the claim doesn't check out. Without
+// this distinction every operational hiccup reads as "commit not found" and
+// permanently blocks a valid completion instead of surfacing as retryable.
+function isSchedulerOperationalError(error: unknown): boolean {
+  if (!isWorkspaceGitScanError(error)) return false;
+  return (
+    error.code === WORKSPACE_GIT_SCAN_ERROR_CODES.saturated ||
+    error.code === WORKSPACE_GIT_SCAN_ERROR_CODES.timeout ||
+    error.code === WORKSPACE_GIT_SCAN_ERROR_CODES.outputLimit ||
+    error.code === WORKSPACE_GIT_SCAN_ERROR_CODES.cancelled
+  );
+}
+
 function normalizeFileList(files: unknown): string[] | null {
   if (!Array.isArray(files)) return null;
   const normalized = files.filter((value): value is string => typeof value === "string" && value.length > 0);
@@ -115,7 +135,8 @@ async function verifyCommitWorkProduct(
 
   try {
     await runGit(["cat-file", "-e", `${sha}^{commit}`], repoPath, repo);
-  } catch {
+  } catch (error) {
+    if (isSchedulerOperationalError(error)) throw error;
     throw unprocessable(
       `Shipped gate: commit ${sha} does not exist in ${repo} (${repoPath}) — this work product's claim does not check out`,
       { code: "shipped_gate_commit_not_found", workProductId: product.id, repo, sha },
@@ -138,7 +159,8 @@ async function verifyCommitWorkProduct(
         ? await runGit(["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha], repoPath, repo)
         : await runGit(["diff-tree", "--no-commit-id", "--name-only", "-r", sha], repoPath, repo);
     actualFiles = stdout.split("\n").map((line) => line.trim()).filter(Boolean);
-  } catch {
+  } catch (error) {
+    if (isSchedulerOperationalError(error)) throw error;
     throw unprocessable(
       `Shipped gate: could not read the diff for commit ${sha} in ${repo} — this work product's claim does not check out`,
       { code: "shipped_gate_diff_unreadable", workProductId: product.id, repo, sha },
@@ -189,18 +211,26 @@ export async function assertShippedGate(input: {
 }): Promise<void> {
   // listForIssue returns every commit work product ever attached to the
   // issue, including ones a later commit superseded (status "failed",
-  // "closed", "archived", or simply no longer isPrimary after a re-run
-  // cleared it -- see work-products.ts createForIssue/update, "last primary
-  // wins" per (issue, type)). Verifying those alongside the current one
-  // means a stale/replaced commit can block a done transition the current,
-  // valid commit would pass on its own. Only the current, live claim is
-  // actually being made right now -- verify that one.
-  const commitProducts = input.workProducts.filter(
-    (product) => product.type === "commit" && product.isPrimary && !TERMINAL_WORK_PRODUCT_STATUSES.has(product.status),
+  // "closed", "archived"). Verifying those alongside the current one means a
+  // stale/replaced commit can block a done transition the current, valid
+  // commit would pass on its own. Only the current, live claim is actually
+  // being made right now -- verify that one.
+  //
+  // "Current" is NOT isPrimary: the public work-product creation contract
+  // defaults isPrimary to false and nothing promotes a commit work product
+  // to primary on creation, so filtering on isPrimary alone would skip
+  // verification for the common case -- every commit work product created
+  // through the default request shape. Use recency instead: among the
+  // non-terminal commit work products, the one most recently written is the
+  // live claim. This still fixes the obsolete-commit case (a superseded
+  // claim has an older updatedAt) without depending on a flag nothing sets.
+  const eligible = input.workProducts.filter(
+    (product) => product.type === "commit" && !TERMINAL_WORK_PRODUCT_STATUSES.has(product.status),
   );
-  if (commitProducts.length === 0) return;
+  if (eligible.length === 0) return;
+  const current = eligible.reduce((latest, product) =>
+    product.updatedAt.getTime() > latest.updatedAt.getTime() ? product : latest
+  );
   const resolveRepoLocalPath = input.resolveRepoLocalPath ?? defaultResolveRepoLocalPath;
-  for (const product of commitProducts) {
-    await verifyCommitWorkProduct(product, resolveRepoLocalPath);
-  }
+  await verifyCommitWorkProduct(current, resolveRepoLocalPath);
 }

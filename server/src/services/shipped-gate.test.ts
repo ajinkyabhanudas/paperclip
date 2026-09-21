@@ -25,11 +25,11 @@ function makeCommitProduct(overrides: Partial<IssueWorkProduct> & { metadata?: R
     url: null,
     status: "active",
     reviewState: "none",
-    // The gate only verifies the current, live claim for an issue (see
-    // assertShippedGate) -- default to true so existing single-product
-    // tests exercise that live path; tests of the obsolete-filtering
-    // behavior itself override this explicitly.
-    isPrimary: true,
+    // isPrimary is NOT what the gate uses to pick the current claim (see
+    // assertShippedGate) -- the default creation contract never sets it, so
+    // it stays false here to match what a real commit work product looks
+    // like when nothing explicitly promotes it.
+    isPrimary: false,
     healthStatus: "unknown",
     summary: null,
     metadata: {},
@@ -182,19 +182,23 @@ describe("assertShippedGate", () => {
     await expect(assertShippedGate({ workProducts: [product], resolveRepoLocalPath: resolveToRepo() })).resolves.toBeUndefined();
   });
 
-  it("ignores a superseded (non-primary) commit work product", async () => {
+  it("verifies a lone commit work product even though isPrimary defaults to false", async () => {
+    // The public creation contract defaults isPrimary to false and nothing
+    // promotes a commit work product to primary on creation -- this is what
+    // every real commit work product looks like. Filtering on isPrimary
+    // would skip verification here entirely; the gate must not do that.
     commitFiles({ "seed.ts": "0" }, "seed commit");
-    const staleSha = commitFiles({ "a.ts": "1" }, "commit later superseded");
-    // Superseded claim: wrong file list, but isPrimary: false means it's no
-    // longer the live claim and must not be checked.
-    const stale = makeCommitProduct({
+    const sha = commitFiles({ "a.ts": "1" }, "commit with a wrong claim");
+    const product = makeCommitProduct({
       isPrimary: false,
-      metadata: { repo: "testrepo", sha: staleSha, files: ["wrong-file.ts"] },
+      metadata: { repo: "testrepo", sha, files: ["wrong-file.ts"] },
     });
-    await expect(assertShippedGate({ workProducts: [stale], resolveRepoLocalPath: resolveToRepo() })).resolves.toBeUndefined();
+    await expect(assertShippedGate({ workProducts: [product], resolveRepoLocalPath: resolveToRepo() })).rejects.toMatchObject({
+      details: { code: "shipped_gate_file_mismatch" },
+    });
   });
 
-  it("ignores a failed/archived/closed commit work product even if primary", async () => {
+  it("ignores a failed/archived/closed commit work product", async () => {
     const sha = commitFiles({ "a.ts": "1" }, "commit" );
     for (const status of ["failed", "archived", "closed"]) {
       const product = makeCommitProduct({
@@ -205,23 +209,42 @@ describe("assertShippedGate", () => {
     }
   });
 
-  it("verifies only the primary commit when a stale and a current one are both attached", async () => {
+  it("verifies only the most recently updated commit when a stale and a current one are both attached", async () => {
     commitFiles({ "seed.ts": "0" }, "seed commit");
     const staleSha = commitFiles({ "a.ts": "1" }, "superseded commit");
     const currentSha = commitFiles({ "b.ts": "2" }, "current commit");
     const stale = makeCommitProduct({
       id: "wp-stale",
-      isPrimary: false,
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
       metadata: { repo: "testrepo", sha: staleSha, files: ["not-real.ts"] },
     });
     const current = makeCommitProduct({
       id: "wp-current",
-      isPrimary: true,
+      updatedAt: new Date("2026-01-02T00:00:00Z"),
       metadata: { repo: "testrepo", sha: currentSha, files: ["b.ts"] },
     });
     await expect(
       assertShippedGate({ workProducts: [stale, current], resolveRepoLocalPath: resolveToRepo() }),
     ).resolves.toBeUndefined();
+  });
+
+  it("rejects when the most recently updated commit's claim is wrong, even with an older valid one present", async () => {
+    commitFiles({ "seed.ts": "0" }, "seed commit");
+    const olderValidSha = commitFiles({ "a.ts": "1" }, "older, valid commit");
+    const newerBadSha = commitFiles({ "b.ts": "2" }, "newer commit with a wrong claim");
+    const olderValid = makeCommitProduct({
+      id: "wp-older",
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      metadata: { repo: "testrepo", sha: olderValidSha, files: ["a.ts"] },
+    });
+    const newerBad = makeCommitProduct({
+      id: "wp-newer",
+      updatedAt: new Date("2026-01-02T00:00:00Z"),
+      metadata: { repo: "testrepo", sha: newerBadSha, files: ["not-real.ts"] },
+    });
+    await expect(
+      assertShippedGate({ workProducts: [olderValid, newerBad], resolveRepoLocalPath: resolveToRepo() }),
+    ).rejects.toMatchObject({ details: { code: "shipped_gate_file_mismatch" } });
   });
 });
 
