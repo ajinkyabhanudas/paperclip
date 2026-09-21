@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { IssueWorkProduct } from "@paperclipai/shared";
-import { assertShippedGate } from "./shipped-gate.js";
+import { assertShippedGate, defaultResolveRepoLocalPath } from "./shipped-gate.js";
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" });
@@ -25,7 +25,11 @@ function makeCommitProduct(overrides: Partial<IssueWorkProduct> & { metadata?: R
     url: null,
     status: "active",
     reviewState: "none",
-    isPrimary: false,
+    // The gate only verifies the current, live claim for an issue (see
+    // assertShippedGate) -- default to true so existing single-product
+    // tests exercise that live path; tests of the obsolete-filtering
+    // behavior itself override this explicitly.
+    isPrimary: true,
     healthStatus: "unknown",
     summary: null,
     metadata: {},
@@ -168,5 +172,74 @@ describe("assertShippedGate", () => {
     await expect(assertShippedGate({ workProducts: [product], resolveRepoLocalPath: resolveToRepo() })).rejects.toMatchObject({
       status: 422,
     });
+  });
+
+  it("verifies a root commit (no parent) via --root instead of reading it as an empty diff", async () => {
+    const sha = commitFiles({ "a.ts": "1", "b.ts": "2" }, "initial commit");
+    const product = makeCommitProduct({
+      metadata: { repo: "testrepo", sha, files: ["a.ts", "b.ts"] },
+    });
+    await expect(assertShippedGate({ workProducts: [product], resolveRepoLocalPath: resolveToRepo() })).resolves.toBeUndefined();
+  });
+
+  it("ignores a superseded (non-primary) commit work product", async () => {
+    commitFiles({ "seed.ts": "0" }, "seed commit");
+    const staleSha = commitFiles({ "a.ts": "1" }, "commit later superseded");
+    // Superseded claim: wrong file list, but isPrimary: false means it's no
+    // longer the live claim and must not be checked.
+    const stale = makeCommitProduct({
+      isPrimary: false,
+      metadata: { repo: "testrepo", sha: staleSha, files: ["wrong-file.ts"] },
+    });
+    await expect(assertShippedGate({ workProducts: [stale], resolveRepoLocalPath: resolveToRepo() })).resolves.toBeUndefined();
+  });
+
+  it("ignores a failed/archived/closed commit work product even if primary", async () => {
+    const sha = commitFiles({ "a.ts": "1" }, "commit" );
+    for (const status of ["failed", "archived", "closed"]) {
+      const product = makeCommitProduct({
+        status,
+        metadata: { repo: "testrepo", sha, files: ["wrong-file.ts"] },
+      });
+      await expect(assertShippedGate({ workProducts: [product], resolveRepoLocalPath: resolveToRepo() })).resolves.toBeUndefined();
+    }
+  });
+
+  it("verifies only the primary commit when a stale and a current one are both attached", async () => {
+    commitFiles({ "seed.ts": "0" }, "seed commit");
+    const staleSha = commitFiles({ "a.ts": "1" }, "superseded commit");
+    const currentSha = commitFiles({ "b.ts": "2" }, "current commit");
+    const stale = makeCommitProduct({
+      id: "wp-stale",
+      isPrimary: false,
+      metadata: { repo: "testrepo", sha: staleSha, files: ["not-real.ts"] },
+    });
+    const current = makeCommitProduct({
+      id: "wp-current",
+      isPrimary: true,
+      metadata: { repo: "testrepo", sha: currentSha, files: ["b.ts"] },
+    });
+    await expect(
+      assertShippedGate({ workProducts: [stale, current], resolveRepoLocalPath: resolveToRepo() }),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("defaultResolveRepoLocalPath", () => {
+  const originalEnv = process.env.SHIPPED_GATE_REPO_PATHS;
+
+  afterEach(() => {
+    if (originalEnv === undefined) delete process.env.SHIPPED_GATE_REPO_PATHS;
+    else process.env.SHIPPED_GATE_REPO_PATHS = originalEnv;
+  });
+
+  it("resolves nothing without configuration -- no hardcoded machine-specific default", () => {
+    delete process.env.SHIPPED_GATE_REPO_PATHS;
+    expect(defaultResolveRepoLocalPath("circaid")).toBeNull();
+  });
+
+  it("resolves from SHIPPED_GATE_REPO_PATHS when configured", () => {
+    process.env.SHIPPED_GATE_REPO_PATHS = JSON.stringify({ circaid: "/some/portable/path" });
+    expect(defaultResolveRepoLocalPath("circaid")).toBe("/some/portable/path");
   });
 });

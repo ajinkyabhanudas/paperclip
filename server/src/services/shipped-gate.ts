@@ -10,20 +10,13 @@
 //
 // Scope (approved 2026-09-10, CIR-39 plan): fires only on issues that already
 // carry a "commit" work product — no gate, no claim, nothing to verify.
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import type { IssueWorkProduct } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
-
-const execFileAsync = promisify(execFile);
+import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
 
 export interface RepoLocalPathResolver {
   (repo: string): string | null;
 }
-
-const DEFAULT_REPO_LOCAL_PATHS: Record<string, string> = {
-  circaid: "/Users/ajinkya/Desktop/circaid-paperclip-pilot",
-};
 
 function loadConfiguredRepoLocalPaths(): Record<string, string> {
   const raw = process.env.SHIPPED_GATE_REPO_PATHS;
@@ -50,20 +43,37 @@ export function defaultResolveRepoLocalPath(repo: string): string | null {
   // this instance's real circaid checkout and get verified against the
   // wrong history. Operators must configure SHIPPED_GATE_REPO_PATHS with
   // whichever exact string metadata.repo actually uses.
-  const configured = loadConfiguredRepoLocalPaths();
-  return configured[repo] ?? DEFAULT_REPO_LOCAL_PATHS[repo] ?? null;
+  //
+  // No baked-in default: an absolute path on one contributor's machine is
+  // not a portable default for any other installation. Every deployment,
+  // including this one, must set SHIPPED_GATE_REPO_PATHS explicitly.
+  return loadConfiguredRepoLocalPaths()[repo] ?? null;
 }
 
 const GIT_TIMEOUT_MS = 10_000;
 
+// Statuses that mark a work product as no longer the live claim for its
+// issue. Combined with isPrimary in assertShippedGate below.
+const TERMINAL_WORK_PRODUCT_STATUSES = new Set(["failed", "archived", "closed"]);
+
+// Routed through the process-wide workspace Git scheduler (already used by
+// the file-browser diff paths) instead of spawning ad hoc child processes.
 // Three of the four call sites run this inside a DB transaction holding a
 // locked issue row (routes/issues.ts recovery path, issue-thread-interactions
-// completion review). A hung git process must not hold that lock forever --
-// bound every call so the worst case is a bounded stall, not a wedged
-// transaction / exhausted connection pool.
-async function runGit(args: string[], cwd: string): Promise<string> {
-  const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], { cwd, timeout: GIT_TIMEOUT_MS });
-  return stdout;
+// completion review) -- a burst of completions must not be able to recreate
+// unbounded child-process pressure, and a hung git process must not hold
+// that lock forever. cacheTtlMs is 0: this is a correctness gate, not a file
+// browser, and must never serve a cached answer for a different commit.
+async function runGit(args: string[], cwd: string, repo: string): Promise<string> {
+  const result = await workspaceGitOperationScheduler.run({
+    workspacePath: cwd,
+    args,
+    operation: "shipped_gate_verify",
+    fairnessKeys: [`shipped-gate-repo:${repo}`],
+    cacheTtlMs: 0,
+    timeoutMs: GIT_TIMEOUT_MS,
+  });
+  return result.stdout;
 }
 
 function normalizeFileList(files: unknown): string[] | null {
@@ -104,7 +114,7 @@ async function verifyCommitWorkProduct(
   }
 
   try {
-    await runGit(["cat-file", "-e", `${sha}^{commit}`], repoPath);
+    await runGit(["cat-file", "-e", `${sha}^{commit}`], repoPath, repo);
   } catch {
     throw unprocessable(
       `Shipped gate: commit ${sha} does not exist in ${repo} (${repoPath}) — this work product's claim does not check out`,
@@ -115,13 +125,18 @@ async function verifyCommitWorkProduct(
   let actualFiles: string[];
   try {
     // Plain diff-tree reports no files for a merge commit (git diffs it
-    // against nothing by default). Diff against the first parent instead so
-    // a merge that actually carries changes still verifies correctly.
-    const parentCount = (await runGit(["rev-list", "--parents", "-n", "1", sha], repoPath))
+    // against nothing by default) and, separately, for a root commit (no
+    // parent to diff against unless --root is passed) -- both would
+    // otherwise read as "touched nothing" and fail every real claim against
+    // it. Diff against the first parent for a merge; pass --root for a
+    // root commit; plain diff-tree otherwise.
+    const parentCount = (await runGit(["rev-list", "--parents", "-n", "1", sha], repoPath, repo))
       .trim().split(/\s+/).length - 1;
     const stdout = parentCount > 1
-      ? await runGit(["diff", "--no-commit-id", "--name-only", "-r", `${sha}^1`, sha], repoPath)
-      : await runGit(["diff-tree", "--no-commit-id", "--name-only", "-r", sha], repoPath);
+      ? await runGit(["diff", "--no-commit-id", "--name-only", "-r", `${sha}^1`, sha], repoPath, repo)
+      : parentCount === 0
+        ? await runGit(["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha], repoPath, repo)
+        : await runGit(["diff-tree", "--no-commit-id", "--name-only", "-r", sha], repoPath, repo);
     actualFiles = stdout.split("\n").map((line) => line.trim()).filter(Boolean);
   } catch {
     throw unprocessable(
@@ -172,7 +187,17 @@ export async function assertShippedGate(input: {
   workProducts: IssueWorkProduct[];
   resolveRepoLocalPath?: RepoLocalPathResolver;
 }): Promise<void> {
-  const commitProducts = input.workProducts.filter((product) => product.type === "commit");
+  // listForIssue returns every commit work product ever attached to the
+  // issue, including ones a later commit superseded (status "failed",
+  // "closed", "archived", or simply no longer isPrimary after a re-run
+  // cleared it -- see work-products.ts createForIssue/update, "last primary
+  // wins" per (issue, type)). Verifying those alongside the current one
+  // means a stale/replaced commit can block a done transition the current,
+  // valid commit would pass on its own. Only the current, live claim is
+  // actually being made right now -- verify that one.
+  const commitProducts = input.workProducts.filter(
+    (product) => product.type === "commit" && product.isPrimary && !TERMINAL_WORK_PRODUCT_STATUSES.has(product.status),
+  );
   if (commitProducts.length === 0) return;
   const resolveRepoLocalPath = input.resolveRepoLocalPath ?? defaultResolveRepoLocalPath;
   for (const product of commitProducts) {

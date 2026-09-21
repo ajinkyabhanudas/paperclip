@@ -13192,9 +13192,6 @@ export function issueRoutes(
       Object.assign(updateFields, transition.patch);
 
       const nextStatus = updateFields.status ?? existing.status;
-    if (nextStatus === "done" && existing.status !== "done") {
-      await assertShippedGate({ workProducts: await workProductsSvc.listForIssue(existing.id) });
-    }
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
         throw unprocessable("unblockDescriptor requires blocked status");
       }
@@ -13667,6 +13664,15 @@ export function issueRoutes(
               !(await assertLockedReviewPolicyAllowsMutation(tx))
             )
               return null;
+            // Runs after the lock-scoped review-policy reauthorization above,
+            // not before it: authorization to move an issue to "done" is a
+            // separate question from whether the claimed commit checks out,
+            // and an unauthorized actor must still get a 403 rather than
+            // whatever the shipped gate happens to say about work products
+            // it was never entitled to look at.
+            if (nextStatus === "done" && existing.status !== "done") {
+              await assertShippedGate({ workProducts: await workProductsSvc.listForIssue(existing.id) });
+            }
             const updated = await updateIssue(tx);
             if (!updated) return null;
             if (commentAttachmentIds?.length) {
